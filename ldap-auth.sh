@@ -9,7 +9,8 @@
 # the user to be authenticated.
 #
 # It then rewrites the username into a DN and tries to bind with it,
-# using the supplied password.
+# using the supplied password, or use a service or anonymous account to 
+# look for the DN associated with the username.
 #
 # When binding succeded, it can optionally execute a search to e.g. check
 # for group memberships or, alternatively, grant access straight away.
@@ -74,11 +75,30 @@ USERNAME_PATTERN='^[a-z|A-Z|0-9|_|-|.]+$'
 
 # Adapt to your needs.
 #SERVER="ldap://ldap-server:389"
-# Will try binding as this user.
+
+# Directly try binding as the requested user, if its CN can be found from its username:
 # ldap_dn_escape escapes special characters in strings to make them
 # usable within LDAP DN components.
 #USERDN="uid=$(ldap_dn_escape "$username"),ou=people,dc=example,dc=com"
 
+# If the username must be found in attributes, we should use the filter to search
+# its DN instead : leave USERDN blank in this case
+
+# If USERDN is not set, we need to bind to the LDAP server either anonymously
+# or using BINDDN/BINDPWD for authentication.
+# AD DCs do not allow anonymous bind (active directory/samba)
+#BIND_ANONYMOUS=1
+
+# If BIND_ANONYMOUS is 0, specify a bind DN which has read permission on the LDAP server:
+#BINDDN="cn=ldapuser,ou=services,dc=example,dc=com"
+#BINDPWD="xxx"
+
+# If USERDN is not specified, FILTER is used as the request to find a user DN
+# from its username:
+#FILTER=(&(&(objectClass=user)(sAMAccountName=$(ldap_dn_escape "$username")))(memberOf=cn=some-group,ou=groups,dc=example,dc=com))"
+
+
+# If USERDN is specified:
 # If you want to take additional checks like requiring group memberships
 # or fetch specific user attributes, you can execute a custom search, which
 # has to return exactly one result in order for authentication to succeed.
@@ -86,6 +106,7 @@ USERNAME_PATTERN='^[a-z|A-Z|0-9|_|-|.]+$'
 #BASEDN="$USERDN"
 #SCOPE="base"
 #FILTER="(&(objectClass=person)(memberOf=cn=some-group,ou=groups,dc=example,dc=com))"
+
 # Space-separated list of additional LDAP attributes to query.
 # You could process them in your own on_auth_success hook.
 #ATTRS="cn"
@@ -119,6 +140,33 @@ ldap_dn_escape() {
 
 
 # The different client implementations.
+ldap_search_curl() {
+	opts="-s -m $TIMEOUT"
+	[ -z "$DEBUG" ] || opts="$opts -v"
+
+	[ "$BIND_ANONYMOUS" -eq "0" ] && opts="$opts -u $BINDDN"
+	[ ! -z "$BINDPWD" ] && opts="$opts:$BINDPWD"
+
+	output=$(curl $opts "$SERVER/$BASEDN?dn,dn?$SCOPE?$FILTER")
+
+	[ $? -ne 0 ] && return 1
+	return 0
+}
+
+ldap_search_ldapsearch() {
+	opts="-o nettimeout=$TIMEOUT -H $SERVER -x"
+	[ -z "$DEBUG" ] || opts="$opts -v"
+
+	[ "$BIND_ANONYMOUS" -eq "0" ] && opts="$opts -D $BINDDN"
+	[ ! -z "$BINDPWD" ] && opts="$opts -w $BINDPWD"
+	[ -z "$BASEDN" ] || opts="$opts -s $SCOPE -b $BASEDN"
+
+	output=$(ldapsearch $opts -LLL "$FILTER" dn)  
+	
+	[ $? -ne 0 ] && return 1
+	return 0
+}
+
 ldap_auth_curl() {
 	[ -z "$DEBUG" ] || verbose="-v"
 	attrs=$(echo "$ATTRS" | sed "s/ /,/g")
@@ -131,17 +179,17 @@ ldap_auth_curl() {
 ldap_auth_ldapsearch() {
 	common_opts="-o nettimeout=$TIMEOUT -H $SERVER -x"
 	[ -z "$DEBUG" ] || common_opts="-v $common_opts"
+
 	if [ -z "$BASEDN" ]; then
 		output=$(ldapwhoami $common_opts -D "$USERDN" -w "$password")
 	else
 		output=$(ldapsearch $common_opts -LLL \
 			-D "$USERDN" -w "$password" \
-			-s "$SCOPE" -b "$BASEDN" "$FILTER" dn $ATTRS)
+		 	-s "$SCOPE" -b "$BASEDN" "$FILTER" dn $ATTRS)
 	fi
 	[ $? -ne 0 ] && return 1
 	return 0
 }
-
 
 # Source the config file.
 if [ -z "$1" ]; then
@@ -163,14 +211,43 @@ fi
 
 # Validate config.
 err=0
-if [ -z "$SERVER" ] || [ -z "$USERDN" ]; then
+if [ -z "$SERVER" ]; then
 	log "SERVER and USERDN need to be configured."
 	err=1
 fi
+
+if [ -z "$USERDN" ]; then
+	if [ -z "$BIND_ANONYMOUS" ] || [ "$BIND_ANONYMOUS" -eq 1 ]; then
+		if [ ! -z "$BINDDN" ] || [ ! -z "$BINDPWD" ]; then
+			log "BINDDN and BINDPWD must not be configured if BIND_ANONYMOUS is not 0"
+			err=1
+		fi
+	elif [ "$BIND_ANONYMOUS" -eq 0 ]; then
+		if [ -z "$BINDDN" ]; then
+			log "BINDDN must be configured if BIND_ANONYMOUS is 1"
+			err=1
+		fi
+	else
+		log "BIND_ANONYMOUS must be 1 or 0"
+		err=1
+	fi
+
+	if [ -z "$FILTER" ]; then
+		log "FILTER must be configured when USERDN is not set"
+		err=1
+	fi
+else
+	if [ ! -z "$BIND_ANONYMOUS"] || [ ! -z "$BINDDN" ] || [ ! -z "$BINDPWD" ]; then
+		log "BIND_ANONYMOUS, BINDDN and BINDPWD are ignored when USERDN is set"
+		err=1
+	fi
+fi
+
 if [ -z "$TIMEOUT" ]; then
 	log "TIMEOUT needs to be configured."
 	err=1
 fi
+
 if [ ! -z "$BASEDN" ]; then
 	if [ -z "$SCOPE" ] || [ -z "$FILTER" ]; then
 		log "BASEDN, SCOPE and FILTER may only be configured together."
@@ -194,6 +271,50 @@ elif [ ! -z "$USERNAME_PATTERN" ]; then
 fi
 
 [ $err -ne 0 ] && exit 2
+
+# Find the user DN if needed
+if [ -z "$USERDN" ]; then
+	case "$CLIENT" in
+		"curl")
+			ldap_search_curl
+			;;
+		"ldapsearch")
+			ldap_search_ldapsearch
+			;;
+		*)
+			log "Unsupported client '$CLIENT', revise the configuration."
+			exit 2
+			;;
+	esac
+	
+	result=$?
+
+	if [ $result -eq 0 ]; then
+		entries=$(echo "$output" | grep -cie '^dn\s*:')
+		if [ "$entries" -eq "0" ]; then
+			log "Invalid user '$username'"
+		elif [ "$entries" -ne "1" ]; then
+			log "Multiple users matching '$username': authentication failed"
+		else
+			result=1
+		fi
+	fi
+
+	if [ ! -z "$DEBUG" ]; then
+		cat >&2 <<-EOF
+		User DN search result: $result
+		Number of entries: $entries
+		Client output:
+		$output
+EOF
+	fi
+	
+	[ $result -ne "1" ] && exit 1
+
+	USERDN=$(echo "$output" | sed -nr "s/^\s*dn:\s*(.+)\s*\$/\1/Ip")
+
+	# proceed with a bind-only authentication
+fi
 
 # Do the authentication.
 case "$CLIENT" in
@@ -223,7 +344,7 @@ if [ ! -z "$DEBUG" ]; then
 		Number of entries: $entries
 		Client output:
 		$output
-		EOF
+EOF
 fi
 
 if [ $result -ne 0 ]; then
